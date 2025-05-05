@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -23,8 +25,12 @@ var (
 
 const (
 	colorGreen      = "\033[32m"
+	colorYellow     = "\033[93m"
+	effectBlink     = "\033[5m"
 	colorReset      = "\033[0m"
 	statusIndicator = "●"
+	barChar         = "■"
+	maxBarWidth     = 40
 )
 
 type Expense struct {
@@ -35,6 +41,11 @@ type Expense struct {
 	Category string
 }
 
+type CategoryTotal struct {
+	Name   string
+	Amount float64
+}
+
 func initDB() {
 	currentUser, err := user.Current()
 	if err != nil {
@@ -42,7 +53,7 @@ func initDB() {
 	}
 	configDir := filepath.Join(currentUser.HomeDir, ".config", "monke")
 	dbPath = filepath.Join(configDir, "monke.db")
-	err = os.MkdirAll(configDir, 0o755)
+	err = os.MkdirAll(configDir, 0755)
 	if err != nil {
 		log.Fatalf("Error creating config directory: %v", err)
 	}
@@ -67,11 +78,11 @@ func initDB() {
 
 var rootCmd = &cobra.Command{
 	Use:   "monke",
-	Short: "return to monke",
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+	Short: "Monke is a simple expense tracker CLI",
+	PersistentPreRun: func(_ *cobra.Command, _ []string) {
 		initDB()
 	},
-	PersistentPostRun: func(cmd *cobra.Command, args []string) {
+	PersistentPostRun: func(_ *cobra.Command, _ []string) {
 		if db != nil {
 			db.Close()
 		}
@@ -81,7 +92,7 @@ var rootCmd = &cobra.Command{
 var addCmd = &cobra.Command{
 	Use:   "add",
 	Short: "Add a new expense",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(cmd *cobra.Command, _ []string) {
 		title, _ := cmd.Flags().GetString("title")
 		amount, _ := cmd.Flags().GetFloat64("amount")
 		day, _ := cmd.Flags().GetInt("day")
@@ -114,11 +125,11 @@ var addCmd = &cobra.Command{
 var lsCmd = &cobra.Command{
 	Use:   "ls",
 	Short: "List all expenses",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, _ []string) {
 		rows, err := db.Query("SELECT id, title, amount, day, category FROM expenses ORDER BY day ASC")
 		if err != nil {
 			if strings.Contains(err.Error(), "no such column: day") {
-				log.Fatalf("Error: Database schema mismatch. The 'day' column is missing or incorrect. If you have existing data from an older version, please migrate it using the SQL statements provided separately or clear the database with './monke clear'.")
+				log.Fatalf("Error: Database schema mismatch. Clear the database with './monke clear'.")
 			}
 			log.Fatalf("Error querying expenses: %v", err)
 		}
@@ -126,7 +137,7 @@ var lsCmd = &cobra.Command{
 
 		var expenses []Expense
 		totalAmount := 0.0
-		categoryTotals := make(map[string]float64)
+		categoryTotalsMap := make(map[string]float64)
 
 		for rows.Next() {
 			var exp Expense
@@ -138,17 +149,16 @@ var lsCmd = &cobra.Command{
 				continue
 			}
 
-			if category.Valid {
+			if category.Valid && category.String != "" {
 				exp.Category = category.String
+				categoryTotalsMap[exp.Category] += exp.Amount
 			} else {
 				exp.Category = ""
+				categoryTotalsMap["Uncategorized"] += exp.Amount
 			}
 
 			expenses = append(expenses, exp)
 			totalAmount += exp.Amount
-			if exp.Category != "" {
-				categoryTotals[exp.Category] += exp.Amount
-			}
 		}
 		if err = rows.Err(); err != nil {
 			log.Fatalf("Error iterating rows: %v", err)
@@ -173,31 +183,41 @@ var lsCmd = &cobra.Command{
 
 			if currentDay > expenseDay {
 				statusOutput = colorGreen + statusIndicator + colorReset
+			} else if currentDay == expenseDay {
+				// Use Bright Yellow + Blink
+				statusOutput = effectBlink + colorYellow + statusIndicator + colorReset
 			}
 
 			displayDateStr := fmt.Sprintf("%02d %s", expenseDay, currentMonthName)
 			amountStr := fmt.Sprintf("%.2f", exp.Amount)
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", exp.Title, amountStr, displayDateStr, exp.Category, statusOutput)
+			displayCategory := exp.Category
+			if displayCategory == "" {
+				displayCategory = "Uncategorized"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", exp.Title, amountStr, displayDateStr, displayCategory, statusOutput)
 		}
 
 		w.Flush()
 
 		fmt.Printf("\nTotal Amount: %.2f\n", totalAmount)
-		if len(categoryTotals) > 0 {
+		if len(categoryTotalsMap) > 0 {
 			fmt.Println("Category Totals:")
 			var categories []string
-			for cat := range categoryTotals {
+			for cat := range categoryTotalsMap {
 				categories = append(categories, cat)
 			}
-			for i := range categories {
-				for j := i + 1; j < len(categories); j++ {
-					if strings.ToLower(categories[i]) > strings.ToLower(categories[j]) {
-						categories[i], categories[j] = categories[j], categories[i]
-					}
+			sort.Slice(categories, func(i, j int) bool {
+				if categories[i] == "Uncategorized" {
+					return false
 				}
-			}
+				if categories[j] == "Uncategorized" {
+					return true
+				}
+				return strings.ToLower(categories[i]) < strings.ToLower(categories[j])
+			})
+
 			for _, cat := range categories {
-				categoryTotal := categoryTotals[cat]
+				categoryTotal := categoryTotalsMap[cat]
 				percentage := 0.0
 				if totalAmount > 0 {
 					percentage = (categoryTotal / totalAmount) * 100
@@ -208,10 +228,73 @@ var lsCmd = &cobra.Command{
 	},
 }
 
+var chartCmd = &cobra.Command{
+	Use:   "chart",
+	Short: "Display category expenses as a simple chart",
+	Run: func(cmd *cobra.Command, _ []string) {
+		query := `
+			SELECT
+				COALESCE(category, 'Uncategorized') as category_name,
+				SUM(amount) as total
+			FROM expenses
+			GROUP BY category_name
+			HAVING total > 0
+			ORDER BY total DESC;
+		`
+		rows, err := db.Query(query)
+		if err != nil {
+			log.Fatalf("Error querying category totals: %v", err)
+		}
+		defer rows.Close()
+
+		var categoryTotals []CategoryTotal
+		grandTotal := 0.0
+
+		for rows.Next() {
+			var ct CategoryTotal
+			err := rows.Scan(&ct.Name, &ct.Amount)
+			if err != nil {
+				log.Printf("Error scanning category total row: %v", err)
+				continue
+			}
+			categoryTotals = append(categoryTotals, ct)
+			grandTotal += ct.Amount
+		}
+		if err = rows.Err(); err != nil {
+			log.Fatalf("Error iterating category totals: %v", err)
+		}
+
+		if len(categoryTotals) == 0 {
+			fmt.Println("No categorized expenses found to chart.")
+			return
+		}
+
+		fmt.Println("Category Expense Chart:")
+		fmt.Printf("Total: %.2f\n\n", grandTotal)
+
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "Category\tAmount\tPercent\tChart")
+		fmt.Fprintln(w, "--------\t------\t-------\t-----")
+
+		for _, ct := range categoryTotals {
+			percentage := 0.0
+			if grandTotal > 0 {
+				percentage = (ct.Amount / grandTotal) * 100
+			}
+			barWidth := int(math.Round((percentage / 100) * float64(maxBarWidth)))
+			bar := strings.Repeat(barChar, barWidth)
+
+			fmt.Fprintf(w, "%s\t%.2f\t%.1f%%\t%s\n", ct.Name, ct.Amount, percentage, bar)
+		}
+
+		w.Flush()
+	},
+}
+
 var clearCmd = &cobra.Command{
 	Use:   "clear",
 	Short: "Delete all expenses from the database",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, _ []string) {
 		reader := bufio.NewReader(os.Stdin)
 		fmt.Print("Are you sure you want to delete ALL expenses? This cannot be undone. [y/N]: ")
 		input, _ := reader.ReadString('\n')
@@ -248,6 +331,7 @@ func main() {
 
 	rootCmd.AddCommand(addCmd)
 	rootCmd.AddCommand(lsCmd)
+	rootCmd.AddCommand(chartCmd)
 	rootCmd.AddCommand(clearCmd)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
