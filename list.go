@@ -204,11 +204,7 @@ func generateColoredLine(categories []string, categoryTotalsMap map[string]float
 			percentage = (categoryTotal / totalAmount) * 100
 		}
 
-		segmentLength := int(math.Round(percentage / 100.0 * float64(totalLineWidth)))
-
-		if segmentLength > remainingWidth {
-			segmentLength = remainingWidth
-		}
+		segmentLength := min(int(math.Round(percentage/100.0*float64(totalLineWidth))), remainingWidth)
 
 		categoryColor, ok := categoryColorMap[cat]
 		if !ok {
